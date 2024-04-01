@@ -146,7 +146,15 @@ goroutine 是按照抢占式进⾏调度的，⼀个 goroutine 最多执⾏10ms�
 5. 在完成全部的扫描和标记⼯作之后，剩余的只有⿊⾊和⽩⾊，分别代表活跃对象与回收对象
 6. 清理所有的⽩⾊对象
 
+# 七、select 实现机制
 
+1. **锁定 scase 中所有 channel**
+2. **按照随机顺序检测 scase 中的 channel 是否 ready**
+   1. 如果 case 可读，读取 channel 中的数据
+   2. 如果 case 可写，写入 channel
+   3. 如果都没准备好，就直接返回
+3. **所有 case 都没有准备好，而且没有 default**
+   1. 
 
 
 
