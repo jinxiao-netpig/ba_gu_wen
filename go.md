@@ -154,7 +154,9 @@ goroutine 是按照抢占式进⾏调度的，⼀个 goroutine 最多执⾏10ms�
    2. 如果 case 可写，写入 channel
    3. 如果都没准备好，就直接返回
 3. **所有 case 都没有准备好，而且没有 default**
-   1. 
+   1. 将当前的 goroutine 加入到所有 channel 的等待队列
+   1. 将当前协程转入阻塞，等待被唤醒
+4. 唤醒
 
 
 
