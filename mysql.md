@@ -1590,5 +1590,5 @@ select city, name, age from t where city = '杭州' order by name limit 1000;
 2. 然后放入 city，name，age 字段，不断地由主键 id 索引到整行再到三个字段的值，匹配查找的值存入 sort_buffer
 3. 然后按 name 排序，返回前 1000 个值
 
-
+但是，如果 sort_buffer_size 设置的太小，无法存放所有匹配的字段，排序就无法在内存中完成。此时，需要借助磁盘临时文件辅助排序
 
