@@ -1573,3 +1573,22 @@ server 层要什么就给什么；
 InnoDB 只给必要的值；
 
 现在的优化器只优化了 count(*) 的语义为“取行数”，其它“显而易见”的优化并没有做
+
+## 38、order by 是怎样工作的？
+
+**example**
+
+```mysql
+select city, name, age from t where city = '杭州' order by name limit 1000;
+```
+
+涉及到用户语句的排序，mysql 会给每个线程分配一块内存用于排序，也就是 sort_buffer。
+
+**执行逻辑**：
+
+1. 先初始化 sort_buffer
+2. 然后放入 city，name，age 字段，不断地由主键 id 索引到整行再到三个字段的值，匹配查找的值存入 sort_buffer
+3. 然后按 name 排序，返回前 1000 个值
+
+
+
