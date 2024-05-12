@@ -1614,4 +1614,10 @@ select city, name, age from t where city = '杭州' order by name limit 1000;
 
 1. **order by rand() 实现**
 
-   创建临时表->按主键顺序取出所有的单词，并给他们⼀个随机小数→初始化 sort_buffer，从内存临时表取出数据放⼊ sort_buffer，按随机数排序，取出前三个，总扫描⾏数是2×n+3
+   创建临时表->按主键顺序取出所有的单词，并给他们⼀个随机小数→初始化 sort_buffer，从内存临时表取出数据放入sort_buffer，按随机数排序，取出前三个，总扫描⾏数是2×n+3
+   
+2. **磁盘临时表**
+
+   如果 sort_buffer_size 设置的小，就会使⽤到磁盘临时表⽤于辅助排序，当然 mysql ⾼版本使⽤了优先队列排序的⽅法，就是只取三个值，构成⼀个堆，然后不断把剩下的值输⼊，用于更新队列。
+
+   这个过程不需要临时⽂件，因此对应的 number_of_tmp_files 是 0。当然，如果堆的大小设置的很大，sort_buffer 放不下，就会舍弃优先队列，重新使⽤临时表+归并排序来实现，number_of_tmp_files 就不再为 0。
