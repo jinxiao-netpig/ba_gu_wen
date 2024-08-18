@@ -311,6 +311,194 @@ type mapextra struct {
 
 **bmap 的 key 和 value 是各自放在一起的**，使用 key/value 这种形式可能会因为**内存对齐**导致内存空间浪费，所以 Go 采用 key 和 value 分开存储的设计，更节省内存空间
 
+# 16、Go map遍历为什么是无序的
+
+Go 语言的设计者们**有意为之**，旨在提示开发者们，Go 底层实现并不保证 map 遍历顺序稳定，请大家不要依赖 range 遍历结果顺序
+
+**主要原因**：
+
+- map 在遍历时，并不是从固定的0号 bucket 开始遍历的，每次遍历，都会从一个**随机值序号的 bucket **，再从其中**随机的 cell **开始遍历
+- map 遍历时，是按序遍历 bucket，同时按需遍历bucket 中和其 overflow bucket 中的 cell。但是 map 在扩容后，会发生 key 的搬迁，这造成原来落在一个 bucket 中的 key，搬迁后，有可能会落到其他 bucket 中了，从这个角度看，遍历 map 的结果就不可能是按照原来的顺序了
+
+如果想顺序遍历 map，需要对 map key 先排序，再按照 key 的顺序遍历 map。
+
+# 17、Go map为什么是非线程安全的
+
+map 默认是并发不安全的，同时对 map 进行并发读写时，程序会 panic，原因如下：
+
+Go 官方在经过了长时间的讨论后，认为 Go map 更应适配典型使用场景（不需要从多个 goroutine 中进行安全访问），而不是为了小部分情况（并发访问），导致大部分程序付出加锁代价（性能），决定了不支持。
+
+**实现 map 线程安全，有两种方式**：
+
+1. 使用读写锁 `map` + `sync.RWMutex`
+2. 使用 Go 提供的 `sync.Map`
+
+# 18、Go map如何查找？
+
+Go 语言中读取 map 有两种语法：带 comma 和 不带 comma。当要查询的 key 不在 map 里，带 comma 的用法会返回一个 bool 型变量提示 key 是否在 map 中；而不带 comma 的语句则会返回一个 value 类型的零值。如果 value 是 int 型就会返回 0，如果 value 是 string 类型，就会返回空字符串。
+
+**查找流程**：
+
+![none](https://raw.githubusercontent.com/jinxiao-netpig/user-image/master/imgs/202408180940055.png)
+
+**1、写保护监测**
+
+函数首先会检查 map 的标志位 flags。如果 flags 的写标志位此时被置 1 了，说明有其他协程在执行“写”操作，进而导致程序 panic，这也说明了 map 不是线程安全的
+
+```go
+if h.flags&hashWriting != 0 {
+	throw("concurrent map read and map write")
+}
+```
+
+**2、计算 hash 值**
+
+```go
+hash := t.hasher(key, uintptr(h.hash0))
+```
+
+key 经过哈希函数计算后，得到的哈希值如下（主流64位机下共 64 个 bit 位）， 不同类型的 key 会有不同的 hash 函数
+
+```
+10010111 | 000011110110110010001111001010100010010110010101010 │ 01010
+```
+
+**3、找到 hash 对应的 bucket**
+
+bucket 定位：**哈希值的低B个bit 位**，用来定位 key 所存放的 bucket
+
+如果当前正在扩容中，并且定位到的旧 bucket 数据还未完成迁移，则使用旧的 bucket（扩容前的 bucket）
+
+```go
+hash := t.hasher(key, uintptr(h.hash0))
+// 桶的个数m-1，即 1<<B-1,B=5时，则有0~31号桶
+m := bucketMask(h.B)
+// 计算哈希值对应的bucket
+// t.bucketsize为一个bmap的大小，通过对哈希值和桶个数取模得到桶编号，通过对桶编号和buckets起始地址进行运算，获取哈希值对应的bucket
+b := (*bmap)(add(h.buckets, (hash&m)*uintptr(t.bucketsize)))
+// 是否在扩容
+if c := h.oldbuckets; c != nil {
+    // 桶个数已经发生增长一倍，则旧bucket的桶个数为当前桶个数的一半
+    if !h.sameSizeGrow() {
+        // There used to be half as many buckets; mask down one more power of two.
+        m >>= 1
+    }
+    // 计算哈希值对应的旧bucket
+    oldb := (*bmap)(add(c, (hash&m)*uintptr(t.bucketsize)))
+    // 如果旧bucket的数据没有完成迁移，则使用旧bucket查找
+    if !evacuated(oldb) {
+        b = oldb
+    }
+}
+```
+
+**4、遍历 bucket 查找**
+
+tophash 值定位：**哈希值的高8个bit 位**，用来快速判断 key 是否已在当前 bucket 中（如果不在的话，需要去 bucket 的 overflow 中查找）
+
+用步骤2中的 hash 值，得到高8个bit位，也就是`10010111`，转化为十进制，也就是**151**
+
+```go
+top := tophash(hash)
+func tophash(hash uintptr) uint8 {
+    top := uint8(hash >> (goarch.PtrSize*8 - 8))
+    if top < minTopHash {
+    	top += minTopHash
+    }
+    return top
+}
+```
+
+上面函数中hash是64位的，sys.PtrSize 值是8，所以`top := uint8(hash >> (sys.PtrSize*8 - 8))`等效`top = uint8(hash >> 56)`，最后top取出来的值就是 hash 的高8位值
+
+在 bucket 及 bucket 的 overflow 中寻找**tophash 值（HOB hash）为 151\* 的 槽位**，即为 key 所在位置，找到了空槽位或者 2 号槽位，这样整个查找过程就结束了，其中找到空槽位代表没找到。
+
+```go
+for ; b != nil; b = b.overflow(t) {
+    for i := uintptr(0); i < bucketCnt; i++ {
+        if b.tophash[i] != top {
+            // 未被使用的槽位，插入
+            if b.tophash[i] == emptyRest {
+                break bucketloop
+            }
+            continue
+        }
+        // 找到tophash值对应的的key
+        k := add(unsafe.Pointer(b), dataOffset+i*uintptr(t.keysize))
+        if t.key.equal(key, k) {
+            e := add(unsafe.Pointer(b), dataOffset+bucketCnt*uintptr(t.keysize)+i*uintptr(t.elemsize))
+            return e
+        }
+    }
+}
+```
+
+![none](https://raw.githubusercontent.com/jinxiao-netpig/user-image/master/imgs/202408181003940.png)
+
+**5、返回 key 对应的指针**
+
+如果通过上面的步骤找到了 key 对应的槽位下标 i，我们再详细分析下 key/value 值是如何获取的：
+
+```go
+// keys的偏移量
+dataOffset = unsafe.Offsetof(struct{
+    b bmap
+    v int64
+}{}.v)
+
+// 一个bucket的元素个数
+bucketCnt = 8
+
+// key 定位公式
+k :=add(unsafe.Pointer(b),dataOffset+i*uintptr(t.keysize))
+
+// value 定位公式
+v:= add(unsafe.Pointer(b),dataOffset+bucketCnt*uintptr(t.keysize)+i*uintptr(t.valuesize))
+```
+
+bucket 里 keys 的起始地址就是 unsafe.Pointer(b)+dataOffset
+
+第 i 个下标 key 的地址就要在此基础上跨过 i 个 key 的大小；
+
+而我们又知道，**value 的地址是在所有 key 之后**，因此第 i 个下标 value 的地址还需要加上所有 key 的偏移。
+
+# 19、Go map冲突的解决方式
+
+**两种解决方案比较**
+
+对于链地址法，基于数组 + 链表进行存储，链表节点可以在需要时再创建，不必像开放寻址法那样事先申请好足够内存，因此链地址法对于内存的利用率会比开方寻址法高。**链地址法对装载因子的容忍度会更高，并且适合存储大对象、大数据量的哈希表**。而且相较于开放寻址法，它更加灵活，支持更多的优化策略，比如可采用红黑树代替链表。但是**链地址法需要额外的空间来存储指针**。
+
+对于开放寻址法，它只有数组一种数据结构就可完成存储，继承了数组的优点，对CPU缓存友好，易于序列化操作。但是它对内存的利用率不如链地址法，且发生冲突时代价更高。**当数据量明确、装载因子小，适合采用开放寻址法。**
+
+**Go map采用链地址法**解决冲突，具体就是**插入key到map中时**，当key定位的桶**填满8个元素后**（这里的单元就是桶，不是元素），将会创建一个溢出桶，并且将溢出桶插入当前桶所在链表尾部。
+
+```go
+if inserti == nil {
+    // all current buckets are full, allocate a new one.
+    newb := h.newoverflow(t, b)
+    // 创建一个新的溢出桶
+    inserti = &newb.tophash[0]
+    insertk = add(unsafe.Pointer(newb), dataOffset)
+    elem = add(insertk, bucketCnt*uintptr(t.keysize))
+}
+```
+
+# 20、Go map 的负载因子为什么是 6.5
+
+**什么是负载因子**：
+
+**负载因子（load factor），用于衡量当前哈希表中空间占用率的核心指标**，也就是每个 bucket 桶存储的平均元素个数。主要目的是**为了平衡 buckets 的存储空间大小和查找元素时的性能高低**。
+
+在 Go 语言中，**当 map存储的元素个数大于或等于 6.5 \* 桶个数 时，就会触发扩容行为**。
+
+把 Go 中的 map 的负载因子硬编码为 6.5
+
+官方测试出来的结果
+
+
+
+
+
 
 
 
