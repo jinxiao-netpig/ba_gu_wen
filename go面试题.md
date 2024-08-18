@@ -679,6 +679,142 @@ channel有3种状态：未初始化、正常、关闭
 
 # 24、Go channel 的底层实现原理
 
+**channel 概念：**
+
+Go中的 channel 是一个**队列**，遵循先进先出的原则，负责**协程之间的通信**（Go 语言提倡不要通过共享内存来通信，而要通过通信来实现内存共享，CSP(Communicating Sequential Process)并发模型，就是通过 goroutine 和 channel 来实现的）
+
+**使用场景**：
+
+- 停止信号监听
+- 定时任务
+- 生产方和消费方解耦
+- 控制并发数
+
+**底层数据结构**：
+
+通过 var 声明或者 make 函数创建的 channel 变量是一个存储在函数栈帧上的指针，占用8个字节，指向堆上的 hchan 结构体
+
+源码包中`src/runtime/chan.go`定义了hchan的数据结构：
+
+![none](https://raw.githubusercontent.com/jinxiao-netpig/user-image/master/imgs/202408182049130.png)
+
+**hchan 结构体：**
+
+```go
+type hchan struct {
+    closed   uint32   // channel是否关闭的标志
+    elemtype *_type   // channel中的元素类型
+
+    // channel分为无缓冲和有缓冲两种。
+    // 对于有缓冲的channel存储数据，使用了 ring buffer（环形缓冲区) 来缓存写入的数据，本质是循环数组
+    // 为啥是循环数组？普通数组不行吗，普通数组容量固定更适合指定的空间，弹出元素时，普通数组需要全部都前移
+    // 当下标超过数组容量后会回到第一个位置，所以需要有两个字段记录当前读和写的下标位置
+    buf      unsafe.Pointer // 指向底层循环数组的指针（环形缓冲区）
+    qcount   uint           // 循环数组中的元素数量
+    dataqsiz uint           // 循环数组的长度
+    elemsize uint16                 // 元素的大小
+    sendx    uint           // 下一次写下标的位置
+    recvx    uint           // 下一次读下标的位置
+
+    // 尝试读取channel或向channel写入数据而被阻塞的goroutine
+    recvq    waitq  // 读等待队列
+    sendq    waitq  // 写等待队列
+
+    lock mutex //互斥锁，保证读写channel时不存在并发竞争问题
+}
+```
+
+**等待队列：**
+
+双向链表，包含一个头结点和一个尾结点
+
+每个节点是一个 sudog 结构体变量，记录哪个协程在等待，等待的是哪个 channel，等待发送/接收的数据在哪里
+
+```go
+type waitq struct {
+    first *sudog
+    last  *sudog
+}
+
+type sudog struct {
+    g *g
+    next *sudog
+    prev *sudog
+    elem unsafe.Pointer 
+    c        *hchan 
+    ...
+}
+```
+
+**操作：**
+
+**1、创建**
+
+使用 `make(chan T, cap)` 来创建 channel，make 语法会在编译时，转换为 `makechan64` 和 `makechan`
+
+```go
+func makechan64(t *chantype, size int64) *hchan {
+    if int64(int(size)) != size {
+    panic(plainError("makechan: size out of range"))
+    }
+
+    return makechan(t, int(size))
+}
+```
+
+创建 channel 有两种，一种是带缓冲的 channel，一种是不带缓冲的 channel
+
+**创建时会做一些检查:**
+
+- 元素大小不能超过 64K
+- 元素的对齐大小不能超过 maxAlign 也就是 8 字节
+- 计算出来的内存是否超过限制
+
+**创建时的策略:**
+
+- 如果是无缓冲的 channel，会直接给 hchan 分配内存
+- 如果是有缓冲的 channel，并且**元素不包含指针**，那么会为 hchan 和底层数组分配一段连续的地址
+- 如果是有缓冲的 channel，并且**元素包含指针**，那么会为 hchan 和底层数组分别分配地址
+
+**2、发送**
+
+发送操作，编译时转换为`runtime.chansend`函数
+
+```go
+func chansend(c *hchan, ep unsafe.Pointer, block bool, callerpc uintptr) bool 
+```
+
+**阻塞式：**
+
+调用 chansend 函数，并且block=true
+
+```go
+ch <- 10
+```
+
+**非阻塞式：**
+
+调用 chansend 函数，并且block=false
+
+```go
+select {
+    case ch <- 10:
+    ...
+
+    default
+}
+```
+
+向 channel 中发送数据时大概分为两大块：**检查**和**数据发送**，数据发送流程如下：
+
+- 如果 channel 的读等待队列存在接收者 goroutine
+- 将数据**直接发送**给第一个等待的 goroutine， **唤醒接收的 goroutine**
+- 如果 channel 的读等待队列不存在接收者goroutine
+- 如果循环数组 buf 未满，那么将会把数据发送到循环数组 buf 的队尾
+- 如果循环数组 buf 已满，这个时候就会走阻塞发送的流程，将当前 goroutine 加入写等待队列，并**挂起等待唤醒**
+
+**3、接收**
+
 
 
 
