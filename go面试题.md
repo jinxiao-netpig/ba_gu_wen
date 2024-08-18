@@ -815,9 +815,68 @@ select {
 
 **3、接收**
 
+发送操作，编译时转换为`runtime.chanrecv`函数
 
+```go
+func chanrecv(c *hchan, ep unsafe.Pointer, block bool) (selected, received bool) 
+```
 
+**阻塞式：**
 
+调用chanrecv函数，并且block=true
+
+```go
+<ch
+
+v := <ch
+
+v, ok := <ch
+
+// 当channel关闭时，for循环会自动退出，无需主动监测channel是否关闭，可以防止读取已经关闭的channel,造成读到数据为通道所存储的数据类型的零值
+for i := range ch {
+	fmt.Println(i)
+}
+```
+
+**非阻塞式：**
+
+调用chanrecv函数，并且block=false
+
+```go
+select {
+    case <-ch:
+    ...
+
+    default
+}
+```
+
+向 channel 中接收数据时大概分为两大块，检查和数据发送，而数据接收流程如下：
+
+- 如果 channel 的写等待队列存在发送者goroutine
+  - 如果是无缓冲 channel，**直接**从第一个发送者 goroutine 那里把数据拷贝给接收变量，**唤醒发送的 goroutine**
+  - 如果是有缓冲 channel（已满），将循环数组 buf 的队首元素拷贝给接收变量，将第一个发送者 goroutine 的数据拷贝到 buf 循环数组队尾，**唤醒发送的 goroutine**
+- 如果 channel 的写等待队列不存在发送者goroutine
+  - 如果循环数组 buf 非空，将循环数组 buf 的队首元素拷贝给接收变量
+  - 如果循环数组buf为空，这个时候就会走阻塞接收的流程，将当前 goroutine 加入读等待队列，并**挂起等待唤醒**
+
+**4、关闭**
+
+关闭操作，调用close函数，编译时转换为`runtime.closechan`函数
+
+```go
+close(ch)
+func closechan(c *hchan) 
+```
+
+**总结**，hchan 结构体的主要组成部分有四个：
+
+- 用来保存 goroutine 之间传递数据的**循环数组**：buf
+- 用来记录此循环数组当前发送或接收数据的**下标值**：sendx 和 recvx
+- 用于保存向该 chan 发送和从该 chan 接收数据**被阻塞的 goroutine 队列**： sendq 和 recvq
+- 保证 channel 写入和读取数据时**线程安全**的锁：lock
+
+# 25、Go channel有无缓冲的区别
 
 
 
