@@ -1482,3 +1482,210 @@ func (v *Value) Store(x interface{})
 
 此类操作确保了写变量的原子性，避免其他操作读到了修改变量过程中的脏数据。
 
+# 36、Go 原子操作和锁的区别
+
+- 原子操作由底层硬件支持，而锁是基于原子操作+信号量完成的。若实现相同的功能，前者通常会更有效率
+- 原子操作是单个指令的互斥操作；互斥锁/读写锁是一种数据结构，可以完成临界区（多个指令）的互斥操作，扩大原子操作的范围
+- 原子操作是无锁操作，属于乐观锁；说起锁的时候，一般属于悲观锁
+- 原子操作存在于各个指令/语言层级，比如“机器指令层级的原子操作”，“汇编指令层级的原子操作”，“Go语言层级的原子操作”等
+- 锁也存在于各个指令/语言层级中，比如“机器指令层级的锁”，“汇编指令层级的锁”，“Go语言层级的锁”等
+
+# 37、Go goroutine 的底层实现原理
+
+**概念：**
+
+Goroutine 可以理解为一种 Go 语言的协程（轻量级线程），是 Go 支持高并发的基础，属于**用户态的线程**，由Go runtime 管理而不是操作系统。
+
+**底层数据结构**
+
+```go
+type g struct {
+    goid    int64 // 唯一的goroutine的ID
+    sched gobuf // goroutine切换时，用于保存g的上下文
+    stack stack // 栈
+    gopc        // pc of go statement that created this goroutine
+    startpc    uintptr // pc of goroutine function
+    ...
+}
+
+type gobuf struct {
+    sp   uintptr // 栈指针位置
+    pc   uintptr // 运行到的程序位置
+    g    guintptr // 指向 goroutine
+    ret  uintptr  // 保存系统调用的返回值
+    ...
+}
+
+type stack struct {
+    lo uintptr // 栈的下界内存地址
+    hi uintptr // 栈的上界内存地址
+}
+```
+
+最终有一个 runtime.g 对象放入调度队列
+
+**状态流转**
+
+| 状态                | 含义                                                         |
+| ------------------- | ------------------------------------------------------------ |
+| 空闲中_Gidle        | G刚刚新建, 仍未初始化                                        |
+| 待运行_Grunnable    | 就绪状态，G在运行队列中, 等待M取出并运行                     |
+| 运行中_Grunning     | M正在运行这个G, 这时候M会拥有一个P                           |
+| 系统调用中_Gsyscall | M正在运行这个G发起的系统调用, 这时候M并不拥有P               |
+| 等待中_Gwaiting     | G在等待某些条件完成, 这时候G不在运行也不在运行队列中(可能在channel的等待队列中) |
+| 已中止_Gdead        | G未被使用, 可能已执行完毕                                    |
+| 栈复制中_Gcopystack | G正在获取一个新的栈空间并把原来的内容复制过去(**用于防止GC扫描**) |
+
+![none](https://raw.githubusercontent.com/jinxiao-netpig/user-image/master/imgs/202409191749497.jpeg)
+
+**创建**
+
+通过`go`关键字调用底层函数`runtime.newproc()`创建一个`goroutine`
+
+当调用该函数之后，goroutine会被设置成`runnable`状态
+
+创建好的这个 goroutine 会新建一个自己的栈空间，同时在 G(也就是这个 goroutine) 的 sched 中维护栈地址与程序计数器这些信息
+
+每个 G 在被创建之后，都会被优先放入到本地队列中，如果本地队列已经满了，就会被放入到全局队列中
+
+**运行**
+
+G 本身只是一个数据结构，真正让 G 运行起来的是**调度器**。Go 实现了一个**用户态的调度器**（GMP模型），这个调度器充分利用现代计算机的多核特性，同时让多个 goroutine(G) 运行，同时 goroutine 设计的很轻量级，调度和上下文切换的代价都比较小。
+
+![none](https://raw.githubusercontent.com/jinxiao-netpig/user-image/master/imgs/202409191805026.png)
+
+**调度时机**
+
+- 新起一个协程和协程执行完毕
+- 会阻塞的系统调用，比如文件io、网络io
+- channel、mutex 等阻塞操作
+- time.sleep
+- 垃圾回收之后
+- 主动调用 runtime.Goshed()
+- 运行过久或系统调用过久等等
+
+每个 M 开始执行 P 的本地队列中的 G 时，这个 G 会被设置成`running`状态
+
+如果某个 M 把本地队列中的 G 都执行完成之后，然后就会去全局队列中拿 G，这里需要注意，每次去全局队列拿 G 的时候，都需要**上锁**，避免同样的任务被多次拿。
+
+如果全局队列都被拿完了，而当前 M 也没有更多的 G 可以执行的时候，它就会去其他 P 的本地队列中拿任务，这个机制被称之为 **work stealing 机制**，每次会拿走**一半**的任务，向下取整，比如另一个 P 中有 3 个任务，拿一半就是一个任务。
+
+当全局队列为空，M 也没办法从其他的 P 中拿任务的时候，就会让自身进入**自旋状态**，等待有新的 G 进来。最多只会有 GOMAXPROCS 个 M 在自旋状态，过多 M 的自旋会浪费 CPU 资源。
+
+**阻塞**
+
+channel 的读写操作、等待锁、等待网络数据、系统调用等都有可能发生阻塞，会调用底层函数`runtime.gopark()`，会让出CPU时间片，让调度器安排其它等待的任务运行，并在下次某个时候从该位置恢复执行。
+
+当调用该函数之后，goroutine 会被设置成`waiting`状态
+
+**唤醒**
+
+处于 waiting 状态的 goroutine，在调用`runtime.goready()`函数之后会被唤醒，唤醒的 goroutine 会被重新放到 M 对应的上下文 P 对应的runqueue 中，等待被调度。
+
+当调用该函数之后，goroutine 会被设置成`runnable`状态
+
+**退出**
+
+当 goroutine 执行完成后，会调用底层函数`runtime.Goexit()`
+
+当调用该函数之后，goroutine 会被设置成`dead`状态
+
+# 38、Go goroutine 和线程的区别
+
+|            | goroutine                                                    | 线程                                                         |
+| ---------- | ------------------------------------------------------------ | ------------------------------------------------------------ |
+| 内存占用   | 创建一个 goroutine 的栈内存消耗为 **2 KB**，实际运行过程中，如果栈空间不够用，会自动进行扩容 | 创建一个 线程 的栈内存消耗为 1 MB                            |
+| 创建和销毀 | goroutine 因为是由 Go runtime 负责管理的，创建和销毁的消耗非常小，是**用户级**。 | 线程的创建和销毀都会有巨大的消耗，因为要和操作系统打交道，是**内核级**的，通常解决的办法就是线程池 |
+| 切换       | goroutines 切换只需保存三个寄存器：PC、SP、BP goroutine 的切换约为 200 ns，相当于 2400-3600 条指令。 | 当线程切换时，需要保存各种寄存器，以便恢复现场。 线程切换会消耗 1000-1500 ns，相当于 12000-18000 条指令。 |
+
+# 39、Go goroutine 泄露的场景
+
+**泄露原因：**
+
+- Goroutine 内进行 channel/mutex 等读写操作被一直阻塞
+- Goroutine 内的业务逻辑进入死循环，资源一直无法释放
+- Goroutine 内的业务逻辑进入长时间等待，有不断新增的 Goroutine 进入等待
+
+**泄露场景：**
+
+1. 如果输出的 goroutines 数量是在不断增加的，就说明存在泄漏
+2. **nil channel：** channel 如果忘记初始化，那么无论你是读，还是写操作，都会造成阻塞
+3. **发送不接收：**channel 发送数量 超过 channel 接收数量，就会造成阻塞
+4. **接收不发送：**channel 接收数量 超过 channel 发送数量，也会造成阻塞
+5. **http request body未关闭：**`resp.Body.Close()` 未被调用时，goroutine不会退出
+6. **互斥锁忘记解锁：**第一个协程获取 `sync.Mutex` 加锁了，但是他可能在处理业务逻辑，又或是忘记 `Unlock` 了。因此导致后面的协程想加锁，却因锁未释放被阻塞了
+7. **sync.WaitGroup使用不当：**由于 `wg.Add` 的数量与 `wg.Done` 数量并不匹配，因此在调用 `wg.Wait` 方法后一直阻塞等待
+
+**排查方法：**
+
+1. 单个函数：调用 `runtime.NumGoroutine` 方法来打印 执行代码前后 Goroutine 的运行数量，进行前后比较，就能知道有没有泄露了。
+2. 生产/测试环境：使用`PProf`实时监测 Goroutine 的数量
+
+# 40、Go 如何查看正在执行的 goroutine 数量
+
+### 程序中引入pprof pakage
+
+```go
+import _ "net/http/pprof"
+```
+
+程序中开启HTTP监听服务：
+
+```go
+package main
+
+import (
+"net/http"
+_ "net/http/pprof"
+)
+
+func main() {
+
+    for i := 0; i < 100; i++ {
+        go func() {
+            select {}
+        }()
+    }
+
+    go func() {
+    	http.ListenAndServe("localhost:6060", nil)
+    }()
+
+    select {}
+}
+```
+
+### 分析goroutine文件
+
+在命令行下执行：
+
+```shell
+go tool pprof -http=:1248 http://127.0.0.1:6060/debug/pprof/goroutine
+```
+
+会自动打开浏览器页面如下图所示
+
+![none](https://raw.githubusercontent.com/jinxiao-netpig/user-image/master/imgs/202409191830256.png)
+
+在图中可以清晰的看到 goroutine 的数量以及调用关系，可以看到有103个 goroutine
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
