@@ -937,7 +937,145 @@ channel 的底层实现中，hchan 结构体中采用 Mutex 锁来保证数据�
 - 空读
 - 多个协程互相等待
 
+# 30、Go 互斥锁的实现原理
 
+sync包提供了两种锁类型：互斥锁sync.Mutex 和 读写互斥锁sync.RWMutex，都属于**悲观锁**。
+
+**概念：**
+
+Mutex 是互斥锁，当一个 goroutine 获得了锁后，其他 goroutine 不能获取锁（只能存在一个写者或读者，不能同时读和写）
+
+**适用场景：**
+
+多个线程同时访问临界区，为保证数据的安全，锁住一些共享资源， 以防止并发访问这些共享数据时可能导致的数据不一致问题。
+
+获取锁的线程可以正常访问临界区，未获取到锁的线程等待锁释放后可以尝试获取锁
+
+![none](https://raw.githubusercontent.com/jinxiao-netpig/user-image/master/imgs/202409191240821.png)
+
+**底层实现结构：**
+
+互斥锁对应的是底层结构是 sync.Mutex 结构体
+
+```go
+type Mutex struct {
+    state int32
+    sema uint32
+}
+```
+
+state 表示锁的状态，有**锁定**、**被唤醒**、**饥饿模式**等，并且是用 state 的**二进制位**来标识的，不同模式下会有不同的处理方式
+
+![none](https://raw.githubusercontent.com/jinxiao-netpig/user-image/master/imgs/202409191251082.png)
+
+sema 表示信号量，mutex 阻塞队列的定位是通过这个变量来实现的，从而实现 goroutine 的阻塞和唤醒
+
+![none](https://raw.githubusercontent.com/jinxiao-netpig/user-image/master/imgs/202409191253668.png)
+
+```go
+addr = &sema
+func semroot(addr *uint32) *semaRoot {  
+    return &semtable[(uintptr(unsafe.Pointer(addr))>>3)%semTabSize].root  
+}
+root := semroot(addr)
+root.queue(addr, s, lifo)
+root.dequeue(addr)
+
+var semtable [251]struct {  
+    root semaRoot  
+    ...
+}
+
+type semaRoot struct {  
+    lock  mutex  
+    treap *sudog // root of balanced tree of unique waiters.  
+    nwait uint32 // Number of waiters. Read w/o the lock.  
+}
+
+type sudog struct {
+    g *g  
+    next *sudog  
+    prev *sudog
+    elem unsafe.Pointer // 指向sema变量
+    waitlink *sudog // g.waiting list or semaRoot  
+    waittail *sudog // semaRoot
+    ...
+}
+```
+
+**操作：**
+
+锁的实现一般会依赖于原子操作、信号量，通过 atomic 包中的一些原子操作来实现锁的锁定，通过**信号量**来实现线程的阻塞与唤醒
+
+**加锁：**
+
+通过原子操作 CAS 加锁，如果加锁不成功，根据不同的场景选择自旋重试加锁或者阻塞等待被唤醒后加锁
+
+![none](https://raw.githubusercontent.com/jinxiao-netpig/user-image/master/imgs/202409191259683.png)
+
+```go
+func (m *Mutex) Lock() {
+    // Fast path: 幸运之路，一下就获取到了锁
+    if atomic.CompareAndSwapInt32(&m.state, 0, mutexLocked) {
+    return
+    }
+    // Slow path：缓慢之路，尝试自旋或阻塞获取锁
+    m.lockSlow()
+}
+```
+
+**解锁：**
+
+通过原子操作 add 解锁，如果仍有 goroutine 在等待，唤醒等待的 goroutine
+
+![none](https://raw.githubusercontent.com/jinxiao-netpig/user-image/master/imgs/202409191300369.png)
+
+**注意：**
+
+- 在 Lock() 之前使用 Unlock() 会导致 panic 异常
+- 使用 Lock() 加锁后，再次 Lock() 会导致死锁（不支持重入），需Unlock()解锁后才能再加锁
+- 锁定状态与 goroutine 没有关联，一个 goroutine 可以 Lock，另一个 goroutine 可以 Unlock
+
+# 31、Go 互斥锁正常模式和饥饿模式的区别
+
+在 Go 中一共可以分为两种抢锁的模式，一种是**正常模式**，另外一种是**饥饿模式**。
+
+**正常模式（非公平锁）**
+
+在刚开始的时候，是处于正常模式（Barging），也就是，当一个 G1 持有着一个锁的时候，G2 会自旋的去尝试获取这个锁
+
+当**自旋超过4次**还没有能获取到锁的时候，这个 G2 就会被加入到获取锁的等待队列里面，并阻塞等待唤醒
+
+> 正常模式下，所有等待锁的 goroutine 按照 FIFO(先进先出)顺序等待。唤醒的 goroutine 不会直接拥有锁，而是会和新请求锁的 goroutine 竞争锁。新请求锁的 goroutine 具有优势：它正在 CPU 上执行，而且可能有好几个，所以刚刚唤醒的 goroutine 有很大可能在锁竞争中失败，长时间获取不到锁，就会切换到饥饿模式
+
+**饥饿模式（公平锁）**
+
+当一个 goroutine 等待锁时间超过 1 毫秒时，它可能会遇到饥饿问题。 在版本1.9中，这种场景下Go Mutex 切换到饥饿模式（handoff），解决饥饿问题。
+
+```go
+starving = runtime_nanotime()-waitStartTime > 1e6
+```
+
+> 饥饿模式下，直接把锁交给等待队列中排在第一位的 goroutine(队头)，同时饥饿模式下，新进来的 goroutine 不会参与抢锁也不会进入自旋状态，会直接进入等待队列的尾部,这样很好的解决了老的 goroutine 一直抢不到锁的场景。
+
+那么也不可能说永远的保持一个饥饿的状态，总归会有吃饱的时候，也就是总有那么一刻 Mutex 会回归到正常模式，那么回归正常模式必须具备的条件有以下几种：
+
+1. G 的执行时间小于1ms
+2. 等待队列已经全部清空了
+
+当满足上述两个条件的任意一个的时候，Mutex 会切换回正常模式，而 Go 的抢锁的过程，就是在这个正常模式和饥饿模式中来回切换进行的。
+
+```go
+delta := int32(mutexLocked - 1<<mutexWaiterShift)  
+if !starving || old>>mutexWaiterShift == 1 {  
+	delta -= mutexStarving
+}
+atomic.AddInt32(&m.state, delta)
+```
+
+**总结：**
+
+对于两种模式，**正常模式下的性能是最好的**，goroutine 可以连续多次获取锁，**饥饿模式解决了取锁公平的问题，但是性能会下降**，其实是性能和公平的 一个平衡模式。
 
 
 
