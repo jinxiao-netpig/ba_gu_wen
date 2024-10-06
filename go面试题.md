@@ -1903,9 +1903,174 @@ G的生命周期：G 从创建、保存、被获取、调度和执行、阻塞�
 
 ![img](https://image-1302243118.cos.ap-beijing.myqcloud.com/imgcdn/33653a35dca9472fd1e487d3a94557c6.writebug)
 
+## 5、调度时机
 
+**在以下情形下，会切换正在执行的 goroutine：**
 
+- 抢占式调度
+- sysmon 检测到协程运行过久（比如sleep，死循环）
+- 切换到g0，进入调度循环
+- 主动调度
+- 新起一个协程和协程执行完毕
+- 触发调度循环
+- 主动调用runtime.Gosched()
+- 切换到g0，进入调度循环
+- 垃圾回收之后
+- stw之后，会重新选择g开始执行
+- 被动调度
+- 系统调用（比如文件IO）阻塞（同步）
+- 阻塞G和M，P与M分离，将P交给其它M绑定，其它M执行P的剩余G
+- 网络IO调用阻塞（异步）
+- 阻塞G，G移动到NetPoller，M执行P的剩余G
+- atomic/mutex/channel等阻塞（异步）
+- 阻塞G，G移动到channel的等待队列中，M执行P的剩余G
 
+## 6、调度策略
+
+**使用什么策略来挑选下一个goroutine执行？**
+
+由于 P 中的 G 分布在 runnext、本地队列、全局队列、网络轮询器中，则需要挨个判断是否有可执行的 G，大体逻辑如下：
+
+- 每执行61次调度循环，从全局队列获取G，若有则直接返回
+- 从P 上的 runnext 看一下是否有 G，若有则直接返回
+- 从P 上的 本地队列 看一下是否有 G，若有则直接返回
+- 上面都没查找到时，则去全局队列、网络轮询器查找或者从其他 P 中窃取，**一直阻塞**直到获取到一个可用的 G 为止
+
+```go
+func schedule() {
+    _g_ := getg()
+    var gp *g
+    var inheritTime bool
+    ...
+    if gp == nil {
+        // 每执行61次调度循环会看一下全局队列。为了保证公平，避免全局队列一直无法得到执行的情况，当全局运行队列中有待执行的G时，通过schedtick保证有一定几率会从全局的运行队列中查找对应的Goroutine；
+        if _g_.m.p.ptr().schedtick%61 == 0 && sched.runqsize > 0 {
+        lock(&sched.lock)
+        gp = globrunqget(_g_.m.p.ptr(), 1)
+        unlock(&sched.lock)
+        }
+    }
+    if gp == nil {
+        // 先尝试从P的runnext和本地队列查找G
+        gp, inheritTime = runqget(_g_.m.p.ptr())
+    }
+    if gp == nil {
+        // 仍找不到，去全局队列中查找。还找不到，要去网络轮询器中查找是否有G等待运行；仍找不到，则尝试从其他P中窃取G来执行。
+        gp, inheritTime = findrunnable() // blocks until work is available
+        // 这个函数是阻塞的，执行到这里一定会获取到一个可执行的G
+    }
+    ...
+    // 调用execute，继续调度循环
+    execute(gp, inheritTime)
+}
+```
+
+从全局队列查找时，如果要所有 P 平分全局队列中的 G，每个 P 要分得多少个，这里假设会分得 n 个。然后把这 n 个 G，转移到当前 G 所在 P 的本地队列中去。**但是最多不能超过 P 本地队列长度的一半（即 128）**。这样做的目的是，如果下次调度循环到来的时候，就不必去加锁到全局队列中再获取一次 G 了，性能得到了很好的保障。源码如下：
+
+```go
+func globrunqget(_p_ *p, max int32) *g {
+    ...
+    // gomaxprocs = p的数量
+    // sched.runqsize是全局队列长度
+    // 这里n = 全局队列的G平分到每个P本地队列上的数量 + 1
+    n := sched.runqsize/gomaxprocs + 1
+    if n > sched.runqsize {
+    	n = sched.runqsize
+    }
+    if max > 0 && n > max {
+    	n = max
+    }
+    // 平分后的数量n不能超过本地队列长度的一半，也就是128
+    if n > int32(len(_p_.runq))/2 {
+    	n = int32(len(_p_.runq)) / 2
+    }
+
+    // 执行将G从全局队列中取n个分到当前P本地队列的操作
+    sched.runqsize -= n
+
+    gp := sched.runq.pop()
+    n--
+    for ; n > 0; n-- {
+        gp1 := sched.runq.pop()
+        runqput(_p_, gp1, false)
+    }
+    return gp
+}
+```
+
+从其它P查找时，会偷一半的G过来放到当前P的本地队列
+
+# 45、Go work stealing 机制
+
+**概念：**
+
+当线程M⽆可运⾏的G时，尝试从其他M绑定的P偷取G，减少空转，提高了线程利用率（避免闲着不干活）。
+
+当从本线程绑定 P 本地 队列、全局G队列、netpoller都找不到可执行的 g，会从别的 P 里窃取G**并放到当前P上面**。
+
+从 *netpoller* 中拿到的G是 _Gwaiting 状态（ 存放的是因为网络IO被阻塞的G），从其它地方拿到的G是  Grunnable状态
+
+从全局队列取的G数量：N = min(len(GRQ)/GOMAXPROCS + 1, len(GRQ/2)) （根据 GOMAXPROCS 负载均衡）
+
+从其它P本地队列**窃取**的G数量：N = len(LRQ)/2（平分）
+
+![img](https://raw.githubusercontent.com/jinxiao-netpig/user-image/master/imgs/202410061705058.png)
+
+## 1、窃取流程
+
+源码见runtime/proc.go stealWork函数，窃取流程如下，如果经过多次努力一直找不到需要运行的goroutine则调用stopm进入睡眠状态，等待被其它工作线程唤醒。
+
+1. 选择要窃取的P
+2. 从P中偷走一半G
+
+**选择要窃取的 P**
+
+窃取的实质就是遍历 allp 中的所有 p，查看其运行队列是否有 goroutine，如果有，则取其一半到当前工作线程的运行队列
+
+为了保证公平性，遍历 allp 时**并不是固定的从allp[0]即第一个p开始**，而是从随机位置上的p开始，而且遍历的顺序也随机化了，并不是现在访问了第i个p下一次就访问第i+1个p，而是使用了一种伪随机的方式遍历 allp 中的每个p，防止每次遍历时使用同样的顺序访问 allp 中的元素
+
+```go
+offset := uint32(random()) % nprocs
+coprime := 随机选取一个小于nprocs且与nprocs互质的数
+const stealTries = 4 // 最多重试4次
+for i := 0; i < stealTries; i++ {
+    for i := 0; i < nprocs; i++ {
+        p := allp[offset]
+        从p的运行队列偷取goroutine
+        if 偷取成功 {
+            break
+        }
+        offset += coprime
+        offset = offset % nprocs
+    }
+}
+```
+
+可以看到只要随机数不一样，偷取p的顺序也不一样，但可以保证经过 nprocs 次循环，每个p都会被访问到。
+
+**从 P 中偷走一半 G**
+
+源码见runtime/proc.go runqsteal函数：
+
+挑选出盗取的对象p之后，则调用 runqsteal 盗取 p 的运行队列中的 goroutine，runqsteal 函数再调用 runqgrap 从 p 的**本地队列尾部**批量偷走一半的 G
+
+为啥是偷一半的g，可以理解为负载均衡
+
+```go
+func runqgrab(_p_ *p, batch *[256]guintptr, batchHead uint32, stealRunNextG bool) uint32 {
+    for {
+        h := atomic.LoadAcq(&_p_.runqhead) // load-acquire, synchronize with other consumers
+        t := atomic.LoadAcq(&_p_.runqtail) // load-acquire, synchronize with the producer
+        n := t - h        //计算队列中有多少个goroutine
+        n = n - n/2     //取队列中goroutine个数的一半
+        if n == 0 {
+            ......
+            return ......
+        }
+        return n
+    }
+}
+```
 
 
 
