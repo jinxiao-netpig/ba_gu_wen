@@ -3235,9 +3235,89 @@ type WaitGroup struct {
 
 # 58、Go Cond 实现原理
 
+## 1、概念
 
+`Go`标准库提供了`Cond`原语，可以让 Goroutine 在满足特定条件时被阻塞和唤醒
 
+## 2、底层数据结构
 
+```go
+type Cond struct {
+    noCopy noCopy
+
+    // L is held while observing or changing the condition
+    L Locker
+
+    notify  notifyList
+    checker copyChecker
+}
+
+type notifyList struct {
+    wait   uint32
+    notify uint32
+    lock   uintptr // key field of the mutex
+    head   unsafe.Pointer
+    tail   unsafe.Pointer
+}
+```
+
+主要有`4`个字段：
+
+- `nocopy` ： golang 源码中检测禁止拷贝的技术。如果程序中有 WaitGroup 的赋值行为，使用 `go vet` 检查程序时，就会发现有报错，但需要注意的是，noCopy 不会影响程序正常的编译和运行
+- `checker`：用于禁止运行期间发生拷贝，**双重检查**(`Double check`)
+- `L`：可以传入一个读写锁或互斥锁，当修改条件或者调用`Wait`方法时需要加锁
+- `notify`：通知链表，调用`Wait()`方法的`Goroutine`会放到这个链表中，从这里获取需被唤醒的 Goroutine 列表
+
+## 3、使用方法
+
+在Cond里主要有3个方法：
+
+- `sync.NewCond(l Locker)`: 新建一个 sync.Cond 变量，注意该函数需要一个 Locker 作为必填参数，这是因为在 `cond.Wait()` 中底层会涉及到 Locker 的锁操作
+- `Cond.Wait()`: 阻塞等待被唤醒，调用Wait函数前**需要先加锁**；并且由于Wait函数被唤醒时存在虚假唤醒等情况，导致唤醒后发现，条件依旧不成立，因此需要使用 for 语句来循环地进行等待，直到条件成立为止
+- `Cond.Signal()`: 只唤醒一个最先 Wait 的 goroutine，可以不用加锁
+- `Cond.Broadcast()`: 唤醒所有Wait的goroutine，可以不用加锁
+
+# 59、Go 有哪些方式安全读写共享变量
+
+| 方法                                                         | 并发原语                           | 备注                                                |
+| ------------------------------------------------------------ | ---------------------------------- | --------------------------------------------------- |
+| 不要修改变量                                                 | sync.Once                          | 不要去写变量，变量只初始化一次                      |
+| 只允许一个goroutine访问变量                                  | Channel                            | 不要通过共享变量来通信，通过通信(channel)来共享变量 |
+| 允许多个goroutine访问变量，但是同一时间只允许一个goroutine访问 | sync.Mutex、sync.RWMutex、原子操作 | 实现锁机制，同时只有一个线程能拿到锁                |
+
+# 60、Go 如何排查数据竞争问题
+
+## 1、概念
+
+只要有两个以上的 goroutine 并发访问同一变量，且**至少其中的一个是写操作**的时候就会发生数据竞争；全是读的情况下是不存在数据竞争的。
+
+## 2、排查方式
+
+```go
+package main
+
+import "fmt"
+
+func main() {
+    i := 0
+
+    go func() {
+        i++ // write i
+    }()
+
+    fmt.Println(i) // read i
+}
+```
+
+`go命令行`有个参数`race`可以帮助检测代码中的数据竞争
+
+```
+$ go run -race main.go
+
+WARNING: DATA RACE
+Write at 0x00c0000ba008 by goroutine 7:
+exit status 66
+```
 
 
 
