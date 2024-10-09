@@ -2889,6 +2889,322 @@ GC没有混合写屏障前，一直是插入写屏障；混合写屏障是插入
 
 # 54、Go 如何查看GC信息
 
+## 1、GODEBUG=‘gctrace=1’
+
+```go
+package main
+func main() {
+    for n := 1; n < 100000; n++ {
+    	_ = make([]byte, 1<<20)
+    }
+}
+$ GODEBUG='gctrace=1' go run main.go
+
+gc 1 @0.003s 4%: 0.013+1.7+0.008 ms clock, 0.10+0.67/1.2/0.018+0.064 ms cpu, 4->6->2 MB, 5 MB goal, 8 P
+gc 2 @0.006s 2%: 0.006+4.5+0.058 ms clock, 0.048+0.070/0.027/3.6+0.47 ms cpu, 4->5->1 MB, 5 MB goal, 8 P
+gc 3 @0.011s 3%: 0.021+1.3+0.009 ms clock, 0.17+0.041/0.41/0.046+0.072 ms cpu, 4->6->2 MB, 5 MB goal, 8 P
+gc 4 @0.013s 5%: 0.025+0.38+0.26 ms clock, 0.20+0.054/0.15/0.009+2.1 ms cpu, 4->6->2 MB, 5 MB goal, 8 P
+gc 5 @0.014s 5%: 0.021+0.16+0.002 ms clock, 0.17+0.098/0.028/0.001+0.016 ms cpu, 4->5->1 MB, 5 MB goal, 8 P
+gc 6 @0.014s 7%: 0.025+1.6+0.003 ms clock, 0.20+0.061/2.9/1.5+0.025 ms cpu, 4->6->2 MB, 5 MB goal, 8 P
+gc 7 @0.016s 7%: 0.019+1.0+0.002 ms clock, 0.15+0.053/1.0/0.018+0.017 ms cpu, 4->6->2 MB, 5 MB goal, 8 P
+gc 8 @0.017s 7%: 0.029+0.17+0.002 ms clock, 0.23+0.037/0.10/0.063+0.022 ms cpu, 4->4->0 MB, 5 MB goal, 8 P
+gc 9 @0.018s 7%: 0.019+0.23+0.002 ms clock, 0.15+0.040/0.16/0.023+0.018 ms cpu, 4->5->1 MB, 5 MB goal, 8 P
+gc 10 @0.018s 7%: 0.022+0.23+0.003 ms clock, 0.17+0.061/0.13/0.006+0.024 ms cpu, 4->6->2 MB, 5 MB goal, 8 P
+gc 11 @0.018s 7%: 0.019+0.11+0.001 ms clock, 0.15+0.033/0.051/0.013+0.015 ms cpu, 4->5->1 MB, 5 MB goal, 8 P
+gc 12 @0.019s 7%: 0.018+0.19+0.001 ms clock, 0.14+0.035/0.10/0.018+0.014 ms cpu, 4->5->1 MB, 5 MB goal, 8 P
+gc 13 @0.019s 7%: 0.018+0.35+0.002 ms clock, 0.15+0.21/0.054/0.013+0.016 ms cpu, 4->5->1 MB, 5 MB goal, 8 P
+gc 14 @0.019s 8%: 0.024+0.27+0.002 ms clock, 0.19+0.022/0.13/0.014+0.017 ms cpu, 4->5->1 MB, 5 MB goal, 8 P
+gc 15 @0.020s 8%: 0.019+0.42+0.038 ms clock, 0.15+0.060/0.28/0.007+0.31 ms cpu, 4->17->13 MB, 5 MB goal, 8 P
+gc 16 @0.021s 8%: 0.018+0.53+0.060 ms clock, 0.14+0.045/0.39/0.005+0.48 ms cpu, 21->28->7 MB, 26 MB goal, 8 P
+gc 17 @0.021s 10%: 0.020+0.91+0.64 ms clock, 0.16+0.050/0.36/0.027+5.1 ms cpu, 12->16->4 MB, 14 MB goal, 8 P
+gc 18 @0.023s 10%: 0.020+0.55+0.002 ms clock, 0.16+0.053/0.50/0.081+0.023 ms cpu, 7->9->2 MB, 8 MB goal, 8 P
+```
+
+字段含义由下表所示：
+
+| 字段  | 含义                                           |
+| :---- | :--------------------------------------------- |
+| gc 2  | 第二个 GC 周期                                 |
+| 0.006 | 程序开始后的 0.006 秒                          |
+| 2%    | 该 GC 周期中 CPU 的使用率                      |
+| 0.006 | 标记开始时， STW 所花费的时间（wall clock）    |
+| 4.5   | 标记过程中，并发标记所花费的时间（wall clock） |
+| 0.058 | 标记终止时， STW 所花费的时间（wall clock）    |
+| 0.048 | 标记开始时， STW 所花费的时间（cpu time）      |
+| 0.070 | 标记过程中，标记辅助所花费的时间（cpu time）   |
+| 0.027 | 标记过程中，并发标记所花费的时间（cpu time）   |
+| 3.6   | 标记过程中，GC 空闲的时间（cpu time）          |
+| 0.47  | 标记终止时， STW 所花费的时间（cpu time）      |
+| 4     | 标记开始时，堆的大小的实际值                   |
+| 5     | 标记结束时，堆的大小的实际值                   |
+| 1     | 标记结束时，标记为存活的对象大小               |
+| 5     | 标记结束时，堆的大小的预测值                   |
+| 8     | P 的数量                                       |
+
+## 2、go tool trace
+
+```go
+package main
+
+import (
+    "os"
+    "runtime/trace"
+)
+
+func main() {
+    f, _ := os.Create("trace.out")
+    defer f.Close()
+    trace.Start(f)
+    defer trace.Stop()
+    for n := 1; n < 100000; n++ {
+    	_ = make([]byte, 1<<20)
+    }
+}
+$ go run main.go
+$ go tool trace trace.out
+```
+
+打开浏览器后，可以看到如下统计：
+
+![img](https://raw.githubusercontent.com/jinxiao-netpig/user-image/master/imgs/202410091523723.png)
+
+点击View trace，可以查看当时的trace情况
+
+![img](https://image-1302243118.cos.ap-beijing.myqcloud.com/imgcdn/f3d74b546b1e360c9d6946757ada4f64.png)
+
+点击 Minimum mutator utilization，可以查看到赋值器 mutator （用户程序）对 CPU 的利用率 74.1%，接近100%则代表没有针对GC的优化空间了
+
+![img](https://raw.githubusercontent.com/jinxiao-netpig/user-image/master/imgs/202410091523809.png)
+
+## 3、debug.ReadGCStats
+
+```go
+package main
+
+import (
+    "fmt"
+    "runtime/debug"
+    "time"
+)
+
+func printGCStats() {
+    t := time.NewTicker(time.Second)
+    s := debug.GCStats{}
+    for {
+        select {
+        	case <-t.C:
+            debug.ReadGCStats(&s)
+            fmt.Printf("gc %d last@%v, PauseTotal %v\n", s.NumGC, s.LastGC, s.PauseTotal)
+        }
+    }
+}
+func main() {
+    go printGCStats()
+    for n := 1; n < 100000; n++ {
+    	_ = make([]byte, 1<<20)
+    }
+}
+$ go run main.go
+
+gc 3392 last@2022-05-04 19:22:52.877293 +0800 CST, PauseTotal 117.524907ms
+gc 6591 last@2022-05-04 19:22:53.876837 +0800 CST, PauseTotal 253.254996ms
+gc 10028 last@2022-05-04 19:22:54.87674 +0800 CST, PauseTotal 376.981595ms
+gc 13447 last@2022-05-04 19:22:55.87689 +0800 CST, PauseTotal 511.420111ms
+gc 16938 last@2022-05-04 19:22:56.876955 +0800 CST, PauseTotal 649.293449ms
+gc 20350 last@2022-05-04 19:22:57.876756 +0800 CST, PauseTotal 788.003014ms
+```
+
+字段含义由下表所示：
+
+| 字段       | 含义       |
+| :--------- | :--------- |
+| NumGC      | GC总次数   |
+| LastGC     | 上次GC时间 |
+| PauseTotal | STW总耗时  |
+
+## 4、runtime.ReadMemStats
+
+```go
+package main
+
+import (
+"fmt"
+"runtime"
+"time"
+)
+
+func printMemStats() {
+    t := time.NewTicker(time.Second)
+    s := runtime.MemStats{}
+    for {
+        select {
+            case <-t.C:
+            runtime.ReadMemStats(&s)
+            fmt.Printf("gc %d last@%v, heap_object_num: %v, heap_alloc: %vMB, next_heap_size: %vMB\n",
+            s.NumGC, time.Unix(int64(time.Duration(s.LastGC).Seconds()), 0), s.HeapObjects, s.HeapAlloc/(1<<20), s.NextGC/(1<<20))
+        }
+    }
+}
+func main() {
+go printMemStats()
+fmt.Println(1 << 20)
+for n := 1; n < 100000; n++ {
+_ = make([]byte, 1<<20)
+}
+}
+$ go run main.go
+
+gc 2978 last@2022-05-04 19:38:04 +0800 CST, heap_object_num: 391, heap_alloc: 20MB, next_heap_size: 28MB
+gc 5817 last@2022-05-04 19:38:05 +0800 CST, heap_object_num: 370, heap_alloc: 4MB, next_heap_size: 4MB
+gc 9415 last@2022-05-04 19:38:06 +0800 CST, heap_object_num: 392, heap_alloc: 7MB, next_heap_size: 8MB
+gc 11429 last@2022-05-04 19:38:07 +0800 CST, heap_object_num: 339, heap_alloc: 4MB, next_heap_size: 5MB
+gc 14706 last@2022-05-04 19:38:08 +0800 CST, heap_object_num: 436, heap_alloc: 6MB, next_heap_size: 8MB
+gc 18253 last@2022-05-04 19:38:09 +0800 CST, heap_object_num: 375, heap_alloc: 4MB, next_heap_size: 6M
+```
+
+字段含义由下表所示：
+
+| 字段        | 含义                                                         |
+| :---------- | :----------------------------------------------------------- |
+| NumGC       | GC总次数                                                     |
+| LastGC      | 上次GC时间                                                   |
+| HeapObjects | 堆中已经分配的对象总数，GC内存回收后HeapObjects取值相应减小  |
+| HeapAlloc   | 堆中已经分配给对象的字节数，GC内存回收后HeapAlloc取值相应减小 |
+| NextGC      | 下次GC目标堆的大小                                           |
+
+# 55、Go 常用的并发模型
+
+并发模型说的是系统中的线程如何协作完成并发任务，不同的并发模型，线程以不同的方式进行**通信**和协作。
+
+## 1、线程间通信方式
+
+线程间通信方式有两种：**共享内存**和**消息传递**，无论是哪种通信模型，线程或者协程最终都会从内存中获取数据，所以更为准确的说法是直接共享内存、发送消息的方式来同步信息
+
+### 1.1、共享内存
+
+**抽象层级**：抽象层级低，当我们遇到对资源进行更细粒度的控制或者对性能有极高要求的场景才应该考虑抽象层级更低的方法
+
+**耦合**：高，线程需要在读取或者写入数据时先获取保护该资源的互斥锁
+
+**线程竞争**：需要加锁，才能避免线程竞争和数据冲突
+
+### 1.2、发送消息
+
+**抽象层级**：抽象层级高，提供了更良好的封装和与领域更相关和契合的设计，比如Go 语言中的`Channel`就提供了 Goroutine 之间用于传递信息的方式，它在内部实现时就广泛用到了共享内存和锁，通过对两者进行的组合提供了更高级的同步机制
+
+**耦合**：低，生产消费者模型
+
+**线程竞争**：保证同一时间只有一个活跃的线程能够访问数据，channel维护所有被该chanel阻塞的协程，保证有资源的时候只唤醒一个协程，从而避免竞争
+
+Go语言中实现了**两种**并发模型，一种是共享内存并发模型，另一种则是 CSP 模型。
+
+## 2、共享内存并发模型
+
+通过直接共享内存 + 锁的方式同步信息，传统多线程并发
+
+![img](https://raw.githubusercontent.com/jinxiao-netpig/user-image/master/imgs/202410091541968.png)
+
+## 3、CSP 并发模型
+
+通过发送消息的方式来同步信息，Go语言推荐使用的*通信顺序进程*（communicating sequential processes）并发模型，通过 goroutine 和 channel 来实现
+
+- `goroutine` 是Go语言中并发的执行单位，可以理解为”线程“
+- `channel`是Go语言中各个并发结构体(`goroutine`)之前的通信机制。 通俗的讲，就是各个`goroutine`之间通信的”管道“，类似于Linux中的管道
+
+![img](https://raw.githubusercontent.com/jinxiao-netpig/user-image/master/imgs/202410091545184.png)
+
+# 56、Go 有哪些并发同步原语
+
+## 1、原子操作
+
+Mutex、RWMutex 等并发原语的底层实现是通过 atomic 包中的一些原子操作来实现的，原子操作是最基础的并发原语
+
+![img](https://raw.githubusercontent.com/jinxiao-netpig/user-image/master/imgs/202410091600388.jpeg)
+
+## 2、Channel
+
+`channel` 管道，高级同步原语，goroutine之间通信的桥梁
+
+使用场景：消息队列、数据传递、信号通知、任务编排、锁
+
+## 3、基本并发原语
+
+Go 语言在 `sync`包中提供了用于同步的一些基本原语，这些基本原语提供了较为基础的同步功能，但是它们是一种相对原始的同步机制，在多数情况下，我们都应该使用抽象层级更高的 Channel 实现同步。
+
+常见的并发原语如下：`sync.Mutex`、`sync.RWMutex`、`sync.WaitGroup`、`sync.Cond`、`sync.Once`、`sync.Pool`、`sync.Context`
+
+### 3.1、sync.Mutex
+
+`sync.Mutex` （互斥锁） 可以限制对临界资源的访问，保证只有一个 goroutine 访问共享资源
+
+**使用场景**：大量读写，比如多个 goroutine 并发更新同一个资源，像计数器
+
+### 3.2、sync.RWMutex
+
+`sync.RWMutex` （读写锁） 可以限制对临界资源的访问，保证只有一个 goroutine 写共享资源，可以有多个goroutine 读共享资源
+
+**使用场景**：大量并发读，少量并发写，有强烈的性能要求
+
+### 3.3、sync.WaitGroup
+
+`sync.WaitGroup` 可以等待一组 Goroutine 的返回
+
+**使用场景**：并发等待，任务编排，一个比较常见的使用场景是批量发出 RPC 或者 HTTP 请求
+
+### 3.4、sync.Cond
+
+`sync.Cond` 可以让一组的 Goroutine 都在满足特定条件时被唤醒
+
+**使用场景**：利用等待 / 通知机制实现阻塞或者唤醒
+
+### 3.5、sync.Once
+
+`sync.Once` 可以保证在 Go 程序运行期间的某段代码只会执行一次
+
+**使用场景**：常常用于单例对象的初始化场景
+
+### 3.6、sync.Pool
+
+`sync.Pool`可以将暂时将不用的对象缓存起来，待下次需要的时候直接使用，不用再次经过内存分配，复用对象的内存，减轻 GC 的压力，提升系统的性能（频繁地分配、回收内存会给 GC 带来一定的负担，严重的时候会引起 CPU 的毛刺）
+
+**使用场景**：对象池化， TCP连接池、数据库连接池、Worker Pool
+
+### 3.7、sync.Map
+
+`sync.Map` 线程安全的map
+
+**使用场景**：map 并发读写
+
+### 3.8、sync.Context
+
+`sync.Context` 可以进行上下文信息传递、提供超时和取消机制、控制子 goroutine 的执行
+
+**使用场景**：取消一个goroutine的执行
+
+## 4、扩展并发原语
+
+### 4.1、ErrGroup
+
+`errgroup` 可以在一组 Goroutine 中提供了同步、错误传播以及上下文取消的功能
+
+**使用场景**：只要一个 goroutine 出错我们就不再等其他 goroutine 了，减少资源浪费，并且返回错误
+
+### 4.2、Semaphore
+
+`Semaphore`带权重的信号量，控制多个goroutine同时访问资源
+
+**使用场景**：控制 goroutine 的阻塞和唤醒
+
+### 4.3、SingleFlight
+
+用于抑制对下游的重复请求
+
+**使用场景**：访问缓存、数据库等场景，缓存过期时只有一个请求去更新数据库
+
+
+
+
+
 
 
 
