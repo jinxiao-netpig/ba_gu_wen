@@ -826,7 +826,7 @@ MySQL 8.0 版本直接将查询缓存的整块功能删掉
 
 ## 2、更新语句执行
 
-### 2.1、redo log VS. binlob
+### 2.1、redo log VS. binlog
 
 1. redo log 是 InnoDB 引擎特有的；binlog 是 MySQL 的 Server 层实现的，所有引擎都可以使用
 2. redo log 是**物理日志**，记录的是“在某个数据页上做了什么修改”；binlog 是**逻辑⽇志**，记录的是这个语句的原始逻辑，⽐如”给 ID=2 这⼀⾏的 c 字段加 1“
